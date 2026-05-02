@@ -76,6 +76,12 @@ Configs:
 %LOCALAPPDATA%\OGX Auto Clicker\configs
 ```
 
+## Contact
+
+For questions, suggestions, bug reports, or feature requests, feel free to contact me on Discord.
+
+**Discord:** ozi.coding
+
 ## Notes
 
 The `Game` input method uses scan-code keyboard events and short mouse press timing. Some games or anti-cheat systems may block synthetic input; this project does not bypass anti-cheat protection.
