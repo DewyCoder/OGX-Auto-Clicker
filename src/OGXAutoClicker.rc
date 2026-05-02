@@ -1,0 +1,4 @@
+#include "resource.h"
+
+IDI_OGX_APP ICON "..\\assets\\ogx_logo.ico"
+IDR_OGX_LOGO_PNG RCDATA "..\\assets\\ogx_logo.png"
