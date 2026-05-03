@@ -17,14 +17,17 @@
 #include "resource.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cwchar>
 #include <functional>
+#include <mutex>
 #include <random>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #pragma comment(lib, "gdiplus.lib")
@@ -34,8 +37,11 @@ using namespace Gdiplus;
 
 namespace {
 
-constexpr UINT_PTR kAutomationTimer = 1;
-constexpr int kTimerMs = 5;
+constexpr UINT_PTR kUiTimer = 1;
+constexpr int kUiTimerMs = 100;
+constexpr UINT kAutomationRepaintMessage = WM_APP + 1;
+constexpr int kAutomationBusySleepMs = 1;
+constexpr int kAutomationIdleSleepMs = 15;
 constexpr int kBurstCycles = 8;
 constexpr int kClientWidth = 1260;
 constexpr int kClientHeight = 720;
@@ -145,6 +151,17 @@ struct KeyboardConfig {
     bool running = false;
     int burstRemaining = 0;
     double lastFireMs = 0.0;
+};
+
+struct MouseFireRequest {
+    MouseButton button = MouseButton::Left;
+    MouseClickConfig config;
+};
+
+struct KeyFireRequest {
+    UINT vk = 0;
+    bool doubleTap = false;
+    InputBackend backend = InputBackend::SendInputBackend;
 };
 
 struct HitArea {
@@ -521,11 +538,12 @@ public:
         SendMessageW(hwnd_, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(wc.hIcon));
         SendMessageW(hwnd_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(wc.hIconSm));
         ApplyWindowOptions();
-        SetTimer(hwnd_, kAutomationTimer, kTimerMs, nullptr);
+        SetTimer(hwnd_, kUiTimer, kUiTimerMs, nullptr);
 
         g_app = this;
         g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandleW(nullptr), 0);
         g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
+        StartAutomationWorker();
 
         ShowWindow(hwnd_, SW_SHOWNORMAL);
         UpdateWindow(hwnd_);
@@ -544,6 +562,7 @@ public:
             UnhookWindowsHookEx(g_mouseHook);
             g_mouseHook = nullptr;
         }
+        StopAutomationWorker();
         SaveConfig();
         return static_cast<int>(msg.wParam);
     }
@@ -585,26 +604,33 @@ public:
             return 0;
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
-            if (numberTarget_ != NumberTarget::None) {
-                HandleNumberKey(static_cast<UINT>(wParam));
-                return 0;
-            }
-            if (captureTarget_ != BindTarget::None) {
-                AssignCapturedKey(static_cast<UINT>(wParam));
-                return 0;
+            {
+                std::lock_guard<std::recursive_mutex> lock(stateMutex_);
+                if (numberTarget_ != NumberTarget::None) {
+                    HandleNumberKey(static_cast<UINT>(wParam));
+                    return 0;
+                }
+                if (captureTarget_ != BindTarget::None) {
+                    AssignCapturedKey(static_cast<UINT>(wParam));
+                    return 0;
+                }
             }
             break;
         case WM_TIMER:
-            if (wParam == kAutomationTimer) {
-                TickAutomation();
+            if (wParam == kUiTimer) {
+                TickUi();
                 return 0;
             }
             break;
+        case kAutomationRepaintMessage:
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
         case WM_PAINT:
             Paint();
             return 0;
         case WM_DESTROY:
-            KillTimer(hwnd_, kAutomationTimer);
+            KillTimer(hwnd_, kUiTimer);
+            StopAutomationWorker();
             StopAllAutomation();
             SaveConfig();
             PostQuitMessage(0);
@@ -620,6 +646,7 @@ public:
             return false;
         }
 
+        std::lock_guard<std::recursive_mutex> lock(stateMutex_);
         if (isDown) {
             if (numberTarget_ != NumberTarget::None) {
                 HandleNumberKey(vk);
@@ -656,6 +683,7 @@ public:
             return false;
         }
 
+        std::lock_guard<std::recursive_mutex> lock(stateMutex_);
         const bool insideApp = IsPointInsideApp(screenPoint);
         if (insideApp && captureTarget_ == BindTarget::None) {
             if (isUp && keyDown_[vk]) {
@@ -920,6 +948,7 @@ private:
     }
 
     void OnMouseMove(int x, int y) {
+        std::lock_guard<std::recursive_mutex> lock(stateMutex_);
         hoverX_ = static_cast<float>(x);
         hoverY_ = static_cast<float>(y);
 
@@ -932,35 +961,17 @@ private:
             mouseInside_ = true;
         }
 
-        const MouseButton old = activeMouseButton_;
-        const bool leftHover = PtInRect(&leftButtonZone_, POINT{x, y}) != FALSE;
-        const bool rightHover = PtInRect(&rightButtonZone_, POINT{x, y}) != FALSE;
-        if (leftHover) {
-            activeMouseButton_ = MouseButton::Left;
-        } else if (rightHover) {
-            activeMouseButton_ = MouseButton::Right;
-        }
-
-        bool hot = leftHover || rightHover;
         int hoverIndex = -1;
-        if (!hot) {
-            for (size_t i = 0; i < hitAreas_.size(); ++i) {
-                const auto& area = hitAreas_[i];
-                if (Contains(area.rect, hoverX_, hoverY_)) {
-                    hot = true;
-                    hoverIndex = static_cast<int>(i);
-                    break;
-                }
+        for (size_t i = 0; i < hitAreas_.size(); ++i) {
+            const auto& area = hitAreas_[i];
+            if (Contains(area.rect, hoverX_, hoverY_)) {
+                hoverIndex = static_cast<int>(i);
+                break;
             }
         }
-        SetCursor(LoadCursor(nullptr, hot ? IDC_HAND : IDC_ARROW));
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
 
-        const bool hoverChanged = old != activeMouseButton_ ||
-                                  leftHover != leftMouseHover_ ||
-                                  rightHover != rightMouseHover_ ||
-                                  hoverIndex != hoverHitIndex_;
-        leftMouseHover_ = leftHover;
-        rightMouseHover_ = rightHover;
+        const bool hoverChanged = hoverIndex != hoverHitIndex_;
         hoverHitIndex_ = hoverIndex;
         if (hoverChanged) {
             InvalidateRect(hwnd_, nullptr, FALSE);
@@ -968,6 +979,7 @@ private:
     }
 
     void OnClick(int x, int y) {
+        std::lock_guard<std::recursive_mutex> lock(stateMutex_);
         if (numberTarget_ != NumberTarget::None) {
             CommitNumberEdit();
         }
@@ -1293,18 +1305,16 @@ private:
         statusUntilMs_ = NowMs() + 1800.0;
     }
 
-    void TickAutomation() {
-        const double now = NowMs();
+    void TickUi() {
         bool repaint = false;
 
-        repaint = TickMouseAction(leftClick_, MouseButton::Left, now) || repaint;
-        repaint = TickMouseAction(rightClick_, MouseButton::Right, now) || repaint;
-        repaint = TickKeyboardAction(now) || repaint;
-        repaint = TickTimedKeyTasks(now) || repaint;
-
-        if (!statusText_.empty() && now > statusUntilMs_) {
-            statusText_.clear();
-            repaint = true;
+        {
+            std::lock_guard<std::recursive_mutex> lock(stateMutex_);
+            const double now = NowMs();
+            if (!statusText_.empty() && now > statusUntilMs_) {
+                statusText_.clear();
+                repaint = true;
+            }
         }
 
         if (repaint) {
@@ -1312,7 +1322,64 @@ private:
         }
     }
 
-    bool TickMouseAction(MouseClickConfig& config, MouseButton button, double now) {
+    void StartAutomationWorker() {
+        if (automationWorkerRunning_.exchange(true)) {
+            return;
+        }
+        automationWorker_ = std::thread([this]() {
+            AutomationLoop();
+        });
+    }
+
+    void StopAutomationWorker() {
+        automationWorkerRunning_.store(false);
+        if (automationWorker_.joinable()) {
+            automationWorker_.join();
+        }
+    }
+
+    void AutomationLoop() {
+        while (automationWorkerRunning_.load()) {
+            std::vector<MouseFireRequest> mouseRequests;
+            std::vector<KeyFireRequest> keyRequests;
+            bool repaint = false;
+            bool active = false;
+
+            {
+                std::lock_guard<std::recursive_mutex> lock(stateMutex_);
+                active = HasActiveAutomationLocked();
+                repaint = CollectAutomationStep(NowMs(), mouseRequests, keyRequests);
+            }
+
+            for (const auto& request : mouseRequests) {
+                FireMouseClick(request.button, request.config);
+            }
+            for (const auto& request : keyRequests) {
+                FireKeyTap(request.vk, request.doubleTap, request.backend);
+            }
+
+            if (repaint && hwnd_) {
+                PostMessageW(hwnd_, kAutomationRepaintMessage, 0, 0);
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(active ? kAutomationBusySleepMs : kAutomationIdleSleepMs));
+        }
+    }
+
+    bool HasActiveAutomationLocked() const {
+        return leftClick_.running || rightClick_.running || keyboard_.running;
+    }
+
+    bool CollectAutomationStep(double now, std::vector<MouseFireRequest>& mouseRequests, std::vector<KeyFireRequest>& keyRequests) {
+        bool repaint = false;
+        repaint = QueueMouseAction(leftClick_, MouseButton::Left, now, mouseRequests) || repaint;
+        repaint = QueueMouseAction(rightClick_, MouseButton::Right, now, mouseRequests) || repaint;
+        repaint = QueueKeyboardAction(now, keyRequests) || repaint;
+        QueueTimedKeyTasks(now, keyRequests);
+        return repaint;
+    }
+
+    bool QueueMouseAction(MouseClickConfig& config, MouseButton button, double now, std::vector<MouseFireRequest>& requests) {
         if (!config.running) {
             return false;
         }
@@ -1322,7 +1389,7 @@ private:
         }
 
         if (config.lastFireMs == 0.0 || now - config.lastFireMs >= config.nextIntervalMs) {
-            FireMouseClick(button, config);
+            requests.push_back(MouseFireRequest{button, config});
             config.lastFireMs = now;
             config.nextIntervalMs = NextMouseIntervalMs(config);
             bool stateChanged = false;
@@ -1348,14 +1415,14 @@ private:
         return 1000.0 / static_cast<double>(std::max(1, cps));
     }
 
-    bool TickKeyboardAction(double now) {
+    bool QueueKeyboardAction(double now, std::vector<KeyFireRequest>& requests) {
         if (!keyboard_.running || !keyboard_.mainKeyEnabled) {
             return false;
         }
 
         const double interval = 1000.0 / static_cast<double>(std::max(1, keyboard_.rate));
         if (keyboard_.lastFireMs == 0.0 || now - keyboard_.lastFireMs >= interval) {
-            FireKeyTap(keyboard_.targetKey, keyboard_.doubleTap);
+            requests.push_back(KeyFireRequest{keyboard_.targetKey, keyboard_.doubleTap, keyboard_.backend});
             keyboard_.lastFireMs = now;
             bool stateChanged = false;
             if (keyboard_.mode == TriggerMode::Burst && keyboard_.burstRemaining > 0) {
@@ -1370,9 +1437,9 @@ private:
         return false;
     }
 
-    bool TickTimedKeyTasks(double now) {
+    void QueueTimedKeyTasks(double now, std::vector<KeyFireRequest>& requests) {
         if (!keyboard_.running) {
-            return false;
+            return;
         }
 
         for (auto& task : keyboard_.tasks) {
@@ -1387,11 +1454,10 @@ private:
             }
 
             if (now - task.lastFireMs >= interval) {
-                FireKeyTap(task.key, false);
+                requests.push_back(KeyFireRequest{task.key, false, keyboard_.backend});
                 task.lastFireMs = now;
             }
         }
-        return false;
     }
 
     void SendMouseButton(DWORD flag) {
@@ -1479,10 +1545,10 @@ private:
         }
     }
 
-    void FireKeyTap(UINT vk, bool doubleTap) {
+    void FireKeyTap(UINT vk, bool doubleTap, InputBackend backend) {
         const int repeats = doubleTap ? 2 : 1;
 
-        if (keyboard_.backend == InputBackend::LegacyMouseEvent) {
+        if (backend == InputBackend::LegacyMouseEvent) {
             const BYTE scan = static_cast<BYTE>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
             const DWORD extended = IsExtendedKey(vk) ? KEYEVENTF_EXTENDEDKEY : 0;
             for (int i = 0; i < repeats; ++i) {
@@ -1500,7 +1566,7 @@ private:
             down.reserve(1);
             up.reserve(1);
 
-            if (keyboard_.backend == InputBackend::GameCompatibleBackend) {
+            if (backend == InputBackend::GameCompatibleBackend) {
                 PushScanKey(down, vk, false);
                 PushScanKey(up, vk, true);
                 SendInput(static_cast<UINT>(down.size()), down.data(), sizeof(INPUT));
@@ -1539,7 +1605,10 @@ private:
         Graphics g(memDc);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
         g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
-        Draw(g, width, height);
+        {
+            std::lock_guard<std::recursive_mutex> lock(stateMutex_);
+            Draw(g, width, height);
+        }
 
         BitBlt(hdc, 0, 0, width, height, memDc, 0, 0, SRCCOPY);
 
@@ -1692,8 +1761,8 @@ private:
         leftButtonZone_ = RectFromRectF(left);
         rightButtonZone_ = RectFromRectF(right);
 
-        DrawMouseButtonZone(g, left, MouseButton::Left, leftMouseHover_ || activeMouseButton_ == MouseButton::Left);
-        DrawMouseButtonZone(g, right, MouseButton::Right, rightMouseHover_ || activeMouseButton_ == MouseButton::Right);
+        DrawMouseButtonZone(g, left, MouseButton::Left, activeMouseButton_ == MouseButton::Left);
+        DrawMouseButtonZone(g, right, MouseButton::Right, activeMouseButton_ == MouseButton::Right);
 
         Pen divider(Rgb(118, 77, 159, 150), 2.0f);
         g.DrawLine(&divider, rect.X + rect.Width / 2, rect.Y + 38, rect.X + rect.Width / 2, rect.Y + 170);
@@ -2381,6 +2450,9 @@ private:
 
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
+    mutable std::recursive_mutex stateMutex_;
+    std::atomic<bool> automationWorkerRunning_{false};
+    std::thread automationWorker_;
     Page page_ = Page::Mouse;
     Language language_ = Language::English;
     MouseClickConfig leftClick_;
@@ -2401,8 +2473,6 @@ private:
     std::vector<HitArea> hitAreas_;
     RECT leftButtonZone_ = {};
     RECT rightButtonZone_ = {};
-    bool leftMouseHover_ = false;
-    bool rightMouseHover_ = false;
     bool mouseInside_ = false;
     int hoverHitIndex_ = -1;
     float hoverX_ = -1.0f;
